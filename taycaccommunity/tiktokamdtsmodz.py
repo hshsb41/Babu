@@ -1,0 +1,466 @@
+from typing import Dict, Any, Optional, List
+import time, random, datetime
+from taycaccommunity.groupaenhaamdtsmodz import *
+from taycaccommunity.lib import *
+
+
+class Group_aenhaamdtsmodz:
+    def __init__(self, logindata, jsdata):
+        self.iv = bytes(jsdata.get("iv"))
+        self.key = bytes(jsdata.get("key"))
+        self.account_id = logindata.get(str(1))
+        self.account_region = jsdata.get("LockRegion")
+        self.account_name = jsdata.get("UserNickName")
+        self.client_version = jsdata.get("ClientVersion")
+
+        # ============ FIX: region_map yang aman (logindata["19"] bisa string/list) ============
+        region_map = {}
+        if isinstance(logindata, dict) and "19" in logindata:
+            val19 = logindata["19"]
+            if isinstance(val19, list):
+                try:
+                    for x in val19:
+                        if isinstance(x, dict) and "2" in x and "1" in x:
+                            region_map[str(x["2"]).upper()] = x["1"]
+                except Exception:
+                    pass
+        if not region_map:
+            region_map = {
+                "VN": 1, "TH": 2, "ID": 3, "TW": 4, "BR": 5, "SG": 7,
+                "US": 8, "RU": 11, "EUROPE": 12, "SAC": 19, "IND": 20,
+                "ME": 21, "NA": 22, "PK": 23, "BD": 25,
+            }
+        self.rc = ("%02X" % region_map[self.account_region.upper()]
+                   if self.account_region and self.account_region.upper() in region_map
+                   else None)
+        self.region_code = self.rc
+
+        self._builder = lambda fields: (
+            lambda packet, length: bytes.fromhex(
+                "%02x%s%s%s%s" % (fields[0][1], self.region_code,
+                                  str(0) * (8 - len(length)) if len(length) < 8 else '', length, packet)))(
+            * (lambda header: (header, hex(len(header) // 2)[2:]))
+            (AES_CBC128(pb_encode(dict(fields[1:])), self.key, self.iv).hex()))
+
+        self.digtstimes = lambda s=datetime.datetime.utcnow(): int(
+            (s + datetime.timedelta(days=(7 - s.weekday())))
+            .replace(hour=6, minute=0, second=0, microsecond=0)
+            .timestamp())
+
+    def _build(self, fields):
+        return self._builder(fields)
+
+    # ... (sisanya method SAMA persis seperti sebelumnya: accept_request_invite, send_message, dll)
+
+    def accept_request_invite(self, uid, rc):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 4
+        fields[2] = {}
+        fields[2][1] = uid
+        fields[2][3] = uid
+        fields[2][8] = 1
+        fields[2][9] = {}
+        fields[2][9][10] = 1
+        fields[2][9][2] = 277
+        fields[2][9][6] = 11
+        fields[2][9][8] = self.client_version,
+        fields[2][9][9] = 3
+        fields[2][10] = rc
+        return self._builder(fields=list(fields.items()))
+
+    def send_message(self, message, messageType, chatid):
+        fields = {}
+        fields[0] = 18
+        fields[1] = 1
+        fields[2] = {}
+        fields[2][1] = self.account_id
+        fields[2][2] = int(chatid)
+        if messageType:
+            fields[2][3] = int(messageType)
+        fields[2][4] = fstr(str(message))
+        fields[2][5] = int(time.time())
+        fields[2][9] = {}
+        fields[2][9][1] = self.account_name
+        fields[2][9][2] = getavatar()
+        fields[2][9][3] = 901027033
+        fields[2][9][4] = 228
+        fields[2][9][10] = 11
+        fields[2][9][11] = 101
+        fields[2][9][13] = {}
+        fields[2][9][13][1] = 2
+        fields[2][9][14] = {}
+        fields[2][9][14][1] = self.account_id
+        fields[2][9][14][2] = 8
+        fields[2][9][14][3] = bytes([15, 6, 21, 8, 10, 11, 19, 12, 17, 4, 14, 20, 7, 2, 1, 5, 16, 3, 13, 18])
+
+        fields[2][10] = self.account_region.lower()
+        fields[2][13] = {}
+        fields[2][13][2] = 0x01
+        fields[2][13][3] = 0x01
+
+        fields[2][14] = {}
+        fields[2][14][1] = {}
+        fields[2][14][1][1] = 0x01
+        fields[2][14][1][2] = 0x01
+        fields[2][14][1][3] = random.randint(1, 5)
+        fields[2][14][1][4] = 0x01
+        fields[2][14][1][5] = self.digtstimes()
+        fields[2][14][1][6] = self.account_region
+        return self._builder(fields=list(fields.items()))
+
+    def send_object(self, payload, chatid, messageType=None):
+        fields = {}
+        fields[0] = 18
+        fields[1] = 1
+        fields[2] = {}
+        fields[2][1] = self.account_id
+        fields[2][2] = int(chatid)
+        if messageType:
+            fields[2][3] = int(messageType)
+        fields[2][5] = int(time.time())
+        fields[2][8] = str(payload)
+        fields[2][9] = {}
+        fields[2][9][1] = self.account_name
+        fields[2][9][2] = getavatar()
+        fields[2][9][3] = 901027033
+        fields[2][9][4] = 228
+        fields[2][9][10] = 11
+        fields[2][9][11] = 101
+        fields[2][9][13] = {}
+        fields[2][9][13][1] = 2
+        fields[2][9][14] = {}
+        fields[2][9][14][1] = self.account_id
+        fields[2][9][14][2] = 8
+        fields[2][9][14][3] = bytes([15, 6, 21, 8, 10, 11, 19, 12, 17, 4, 14, 20, 7, 2, 1, 5, 16, 3, 13, 18])
+
+        fields[2][10] = self.account_region.lower()
+        fields[2][13] = {}
+        fields[2][13][2] = 0x01
+        fields[2][13][3] = 0x01
+
+        # Ditambahkan agar struktur fields[2][14] sama persis seperti send_message
+        fields[2][14] = {}
+        fields[2][14][1] = {}
+        fields[2][14][1][1] = 0x01
+        fields[2][14][1][2] = 0x01
+        fields[2][14][1][3] = random.randint(1, 5)
+        fields[2][14][1][4] = 0x01
+        fields[2][14][1][5] = self.digtstimes()
+        fields[2][14][1][6] = self.account_region
+
+        return self._builder(fields=list(fields.items()))
+
+    def open_squad(self, tc):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 1
+        
+        fields[2] = {}
+        fields[2][2] = bytes([11])  # Representasi dari "\u0001"
+        fields[2][3] = 1
+        fields[2][4] = int(tc - 1) # Menyesuaikan argument "tc" dari parameter agar tetap dinamis
+        fields[2][5] = self.account_region.lower()  # Menggantikan "en" dengan variabel bahasa/region
+        fields[2][8] = {1: "IDC1", 2: 48, 3: self.account_region}  # Menggantikan "ID" dengan variabel region
+        fields[2][9] = 2
+        fields[2][10] = bytes([1, 9, 10, 11, 18, 25, 32, 39])  # Representasi "\u0001\t\n\u000b\u0012\u0019 '"
+        fields[2][11] = 1
+        fields[2][13] = 1
+        
+        fields[2][14] = {}
+        fields[2][14][1] = "080280006467A4C3020100000000000400050001000000004C3324180F0000004676251400000000000000000000000000000000000000ff00000000cacfa16d"
+        fields[2][14][2] = 93
+        fields[2][14][3] = "p\\XT\u0013\u0002\tH\u0002\u0003\u0001\u000fS\u0005\u0002\u0002\u0004\u000f\u0004\u0002Q\b\u000f\u0002W\u0006\u0001VX\u0004TQ]P\u0003VR\u0001\u0007[\u0017\u0006\u0002EsXDEI\u001b\t\u0018\u0006\u001a\u001a\u0007\u0007H\u001aBcsXPC}w[RHepI\u001f^\\A\u0003WCBj_he\n\u0010\bJ\u001e\u0001^w\u001ck\u0005Ez\fUbCcr\u001cTQEFCAWg\u0001\u0001\u0007\u0004\u0017\u0006\u0000EgrAhei~[gQcDA}_\bDqC\u0003\u0004`cZmse\u000e\u001a\fK\\An\f{G\tq\u000bafX_^\u0002qX@ZSNF{Cc^G\f\u0013\u0001Ex[krOe\\}\u0006\u0000QCRZC\u0019lXA\u0005Avv\u0003\u0003p{\b\u0017\bLF\u000fSeIsUzq\u0001SwJY\u0000r~S{Na]|XVT~\u0004\u0015\u0004\fM\\\u0007q}}gLa\u0001{\u0006RXXsuVJZr\u0005BU\u0002n\u0004D\u000e\u001a\u0005Iw\u001e|UsL||qBYuittXMrbm^tuguv^\t\u0014\u0007E\u0007y\u001bg[cs{NDm~c\\W|~O\u001fD\u0001{\u0006l\u001bh_\u000e\u001a\u0006\u0007O\rd\u0005\fped~aDr}bvz\u007fC\u0003xBezC\u0002_]x\r\u0010\fHU\u0002vDVsuCZh`\u0000tTcLX\u0001dEtwBf\t\u0003p\t"
+        fields[2][14][4] = "wY[Q"
+        fields[2][14][6] = 11
+        fields[2][14][7] = {3: 2071688288}
+        fields[2][14][8] = self.client_version  # Menggantikan 1.130.22 menggunakan variabel versi
+        fields[2][14][9] = 3
+        fields[2][14][10] = 2
+        fields[2][14][11] = "\u0003bbSQ61JJBA4FAdV2KyoVlW39FjLPYC+QTWlQzE6kzmAk37hk/Va7/dNorNdc1eHg211Am98XSECZ0RYZxpWRRtGDQ/1nAcmsWIwu18IPWzwlEfZzZuQE47NiJwi198nygyf5T8NF0OL4csXLqyck5SHMRJrAZkxJs/c31i42BbSk21eOYArT1cYT6BUNKpWUA8687K8Za9Cnn89MydzMiKKC6ag7ozUK8XHdtpLB0cBNBkrojGLY2rTljHVpTUILrYM0mcPW3fWHT/+4c23m8owsCxfWtub2p0Oh9/PsXBy6Pp5RmZe5OM0mmAYaHb0cHPp924/gfUMH3X/pEGe0ykK3N5i7AvkOdIymfoV//W8Nah3fxtmCsK5mipYz4Vj3VRB4p+/vF/S0hxelTqwoQAzxicLPEYnEpCvccFTTdx/iSqkBn6AH+yUqlH8Y9aGSkiuu5SXHn7uIi1bFrANOgHNuy5tJjl024kovRsrLT5LlvimlmioUGMzYCSDncSmB3D5PnkhdBsmkNZyYJWYtOYS9TAgP8JSNUzL7AURIbnnj8XrWlPeYxN/oJqEjI2Tqjd5R7klw1YCoBsff/K9aMOsj8lFZtgvgAXhEbH4RFlQZ"
+        
+        fields[2][19] = 329
+        fields[2][21] = "7OR\u0019"
+        fields[2][24] = [{1: 3, 2: 391}, {1: 4, 2: 385}, {1: 5, 2: 192}, {1: 29, 2: 204}, {1: 22, 2: 120}, {1: 14, 2: 175}, {1: 21}]
+        fields[2][27] = "a_2504800200314510578"
+        
+        return self._builder(fields=list(fields.items()))
+
+    def join_squad_recruit(self, uid, rc):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 4
+        fields[2] = {}
+        fields[2][1] = uid
+        fields[2][15] = rc
+        fields[2][4] = bytes([1, 7, 9, 10, 11, 18, 25, 26, 32])
+        fields[2][6] = 5
+        fields[2][8] = 1
+        fields[2][9] = {}
+        fields[2][9][10] = 1
+        fields[2][9][2] = 277
+        fields[2][9][6] = 11
+        fields[2][9][8] = self.client_version,
+        fields[2][9][9] = 3
+        return self._builder(fields=list(fields.items()))
+
+    def join_squad(self, tc):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 4
+        fields[2] = {
+            4: bytes([1, 7, 9, 10, 11, 18, 25, 32, 39]),
+            5: str(tc), 6: 6, 8: 1,
+            9: {
+                1: "08FFF3BE903F27DF0203110111110000006B0003006800169194106F13CF106E4676251411010404dfe9e8b5ca3ca4f96a3119c00000004f03060301cacfa16d",
+                2: 130,
+                3: "tY_S\u0013\b\u0001M\u0002\u0000T\u0000\u0005\u000e\b\t\u0002\u0000\u0003U\u0003\u0001V\u000fR\u000e\tRQ\u0002\u0004\u0005US\u0003XS\u0005\u0001\u0002\u0011\u0001\u0002JuTAEN\u001e\u0002\u001c\u0002\u001f\u0013\b\u0003M\u001cDbz_Q@}p_QOgsC\u001dYVI\u0004UAAj_ga\u0004\u0012\u0000K\u001d\u0007_t\u0019b\bCx\u0002UeGat\u001fTTCBLER`\u0006\u0001\r\f\u0012\u0006\u0005N^^\u0002acH~r\u0004_\u0003RO|\u000bcd_@~`Rnqrgh\n\u0015\nL\\Nh\u0000~G\u000et\u0000eb]VQ\u0006t^F[ZIGxCdZD\u000b\u0011\u0002OA~LP@\u000fcSDyATQApaT^{|wa]\\\u0001E\u000f\u0013\nJfxve}\u0004J\u0003c{YL\u0007^^yDYQf\bhe\u0005_wg\r\u0010\u0007\bEHpX@||\u0002Z\\uTGyA\u0001JP\u0005t~VkTE\u0000J\\\u000b\u0013\nMr\u0018zTzK}qE]vnvwROuheYvwduvQ\r\u001a\u0005M\u0006z\u001dfXfzvHFc~dXUz}O\u001aB\u0005t\u0002i\u001co_\u0004\u0012\u0003\u0007J\u0006b\u0003\u000eqlfvbEstgu~wB\u0001v@`yI\u0002ZPx\f\u0014\u0003NR\u0002yBZvuD_cd\u0004q]lH]\u0007bD}pCe\t\u0004t\n",
+                4: "w^_R", 6: 11, 7: "\u0014\u0004aqrg\u0015\u0013", 8: self.client_version, 9: 3, 10: 2,
+                11: "\u0003bbSQ6wxegh9qAdV2KyoVleA17yPmYF+yTnOrl+JMknmppeUBe5ZsiHueP2mZZ4KOs6b2Ail1S9z3qIeU9hGFZ2M6PP39/zjIc/RFVPAkgDagySswMVmYaPhkzU5IqNPow2843fyQUz9xI10NdMhl1WiI4Y6wCXBotiUS9wSgujQ4j0fWXUyklCxBWo8r27hyoGSVrPdTPXFMnJJpPRRFFmWqc3fWvMg+BNfxSRJOZRSrkzG0nNvSIJ4uZB2pqAlHIPEYx7bI6zsgwUVDiLZJKTUTyuCGbOd1DegDUFfazFesTG1LJknT5WhgzCsrBIy+f2l+LeJe5DW7wEwNaHambM7ECXcJcLIhB9kJJsW0tFvXkk3HSdcQ8N1K6wjSKWhpkW0kV8Zrjj0jkhS/7AZ6T9GJRIA827YDtTorBvbx1UkXjYrqYI1nSa2GaMexGnqlurc5DE3v1R+mUBI9GqmjEPgTSYVBxyeCdQMHaMXGtspAhvkiO84ToU87sP45pylDEfFOVoc/rcmdzWeqlYPsv6txKRtIHcb0cO+MoVShoU8ZUVRDF3znbqzVrscPIfplBaa79lwvQqzRubLl9XY="
+            },
+            11: {1: "IDC4", 2: 281, 3: self.account_region},
+            13: self.account_region.lower(), 16: "7OR\u0019", 20: "\b\u0015", 27: "\bH\u0010\u0003"
+        }
+        return self._build(list(fields.items()))
+
+    def tes_packet(self):
+        fields = {}
+        fields[0] = 5
+        fields = 1
+        fields = {}
+        fields = bytes([11])
+        fields = 43
+        fields[7] = {1: "IDC1", 2: 62, 3: self.account_region}
+        fields[8] = 1
+        fields[9] = {0: 2313188923893483783}
+        fields[11] = 1
+        fields[12] = {
+            1: "088B82387C2C337A020101000000000D00140001000600028BFA74250F00000046762514000000010000000000000000000000000000004f00000000cacfa16d",
+            2: 190,
+            3: "pPXT\u0016\b\tK\f\u0001\u0000\u000f_\u0005\u0002\u0007\u000e\u000f\u0007\fS\t\u000f\u000eW\u0006\u0004\\X\u0007ZS\\P\u000fVR\u0004\r[\u0014\b\u0000DsTDEL\u0011\t\u001b\b\u0018\u001b\u0007\u000bH\u001aGis[^A|wWRH`zI\u001cP^@\u0003[CBoUhf\u0004\u0012\tJ\u0012\u0001^r\u0016k\u0006Kx\rUnCcw\u0016TRKDBA[g\u0001\u0004\r\u0004\u0014\b\u0002Dg~Ah`c~XiSbDM}_\rNq@\r\u0006acVms`\u0004\u001a\u000fE^@n\u0000{G\f{\u000bbhZ^^\u000eqXEPSMHyBcRG\f\u0016\u000bE{UisOi\\}\u0003\nQ@\\XB\u0019`XA\u0000Kvu\r\u0001q{\u0004\u0017\bIL\u000fPkKrUvq\u0001V}JZ\u000ep\u007fSwNaXvXUZ|\u0005\u0015\b\fMY\rq~seMa\r{\u0006WRXp{TKZ~\u0005BP\bn\u0007J\f\u001b\u0005Ew\u001ey_sOr~pBUuiq~XN|`l^xugp|^\n\u001a\u0005D\u0007u\u001bg^isx@Fl~o\\WytO\u001cJ\u0003z\u0006`\u001bhZ\u0004\u001a\u0005\tM\fd\t\fp`n~bJp|bzz\u007fF\txAkxB\u0002S]x\b\u001a\fK[\u0000wDZsuFPhc\u000evUc@X\u0001aOttLd\b\u0003|\t",
+            4: "vYWQ",
+            6: 11,
+            7: {3: 1869638767},
+            8: self.client_version,
+            9: 3,
+            10: 2,
+            11: "\u0003bbSQ62o8qy56AdV2KyoVlcoG8vHEbJJBlMvp4XU5cit56H5agwwHOWFuCmOBd2aHeWWDXQxJgnl+HIfiPOIPf1pKN+3dYEGYEf2x3H6VRISEbFEAqjN48wR3v7ZAj4fm0WY7IETpqFt8a2SxxTZWh9LuHt8XXB+87aeYPf0xui0uIWChgUiHpNuY/+ZiDpOXRJk+13Km+4wmoUH5xAIfywQxsT5HKkfUlWVdms0Udl7Ooq/yHzWsqdP232O0fvn+7x9pZsXUa9vB2NWqQ5AjhDVnYczLoV75t9OdJmM/w4B4oEESw13C15w1Albql2vH1GIRwn59ibDNlnSuX7r7EaRvhyTJX7meL96wqi42LjizTzdkIRyXfQ1DC2BOPyJkNI54Jknel8I67+1r67no0ZC0lZe+xNkQtILREKV50HpBQa3liXoqx3SY8TO3byn8+f4AChOWjfqnbyzHQN+Y2kv1gQYCcJ8NxevUUNGMqgaHrRJ4q4tM2IJw0DOZtCGzqpnfeI8OLdPr7VIfBcOfwA6IDMeWSTGWII4Qzhie6DqcHig9pukOS7TGDx95l/rEjvOAbd/5QXqaiLWv+WHyRzwfDSILtGHVStbhmKOe"
+        }
+        fields[20] = [{1: 3, 2: 391}, {1: 4, 2: 385}, {1: 5, 2: 192}, {1: 29, 2: 204}, {1: 22, 2: 120}, {1: 14, 2: 175}, {1: 21}]
+        fields[21] = "a_2504800200314510578"
+        return self._builder(fields=list(fields.items()))
+
+    def invite_squad(self, user_id, invite_type):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 2
+        fields[2] = {}
+        fields[2][1] = int(user_id)
+        fields[2][2] = self.account_region
+        fields[2][4] = int(invite_type)
+        return self._builder(fields=list(fields.items()))
+
+    def request_join_squad(self, user_id):
+        badge = random.choice([4096, 16384, 8192, 1048576])
+        fields = {}
+        fields[0] = 5
+        fields[1] = 33
+        fields[2] = {}
+        fields[2][1] = int(user_id)
+        fields[2][2] = self.account_region
+        fields[2][3] = 1
+        fields[2][4] = 1
+        fields[2][5] = bytes([1, 7, 9, 10, 11, 18, 25, 26, 32])
+        fields[2][6] = self.account_name
+        fields[2][7] = 330
+        fields[2][8] = 1000
+        fields[2][10] = self.account_region
+        fields[2][11] = bytes([49, 97, 99, 52, 98, 56, 48, 101, 99, 102, 48, 52, 55, 56,
+                               97, 52, 52, 50, 48, 51, 98, 102, 56, 102, 97, 99, 54, 49, 50, 48, 102, 53])
+        fields[2][12] = 1
+        fields[2][13] = int(user_id)
+        fields[2][16] = 1
+        fields[2][17] = 1
+        fields[2][18] = 312
+        fields[2][19] = 15
+        fields[2][23] = bytes([16, 1, 24, 1])
+        fields[2][24] = getavatar()
+        fields[2][26] = ''
+        fields[2][28] = ''
+        fields[2][31] = {}
+        fields[2][31][1] = 1
+        fields[2][31][2] = badge
+        fields[2][32] = badge
+        fields[2][34] = {}
+        fields[2][34][1] = self.account_id
+        fields[2][34][2] = 8
+        fields[2][34][3] = bytes([15, 6, 21, 8, 10, 11, 19, 12, 17, 4, 14, 20, 7, 2, 1, 5, 16, 3, 13, 18])
+        return self._builder(fields=list(fields.items()))
+
+    def leave_squad(self, uid: int = 0x1):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 7
+        fields[2] = {}
+        fields[2][1] = int(uid)
+        return self._builder(fields=list(fields.items()))
+
+    def leave_channel(self, cid, type):
+        fields = {}
+        fields[0] = 18
+        fields[1] = 4
+        fields[2] = {}
+        fields[2][1] = int(cid)
+        if type:
+            fields[2][2] = int(type)
+        fields[2][3] = self.account_region.lower()
+        return self._builder(fields=list(fields.items()))
+
+    def join_channel(self, cid, ccode, ctype):
+        fields = {}
+        fields[0] = 18
+        fields[1] = 3
+        fields[2] = {}
+        if cid:
+            fields[2][1] = int(cid)
+        if ctype:
+            fields[2][2] = int(ctype)
+        if ccode:
+            fields[2][4] = str(ccode)
+        fields[2][3] = self.account_region.lower()
+        return self._builder(fields=list(fields.items()))
+
+    def animation_packet(self, bundle_id):
+        fields = {}
+        fields[0] = 5  # Menyesuaikan struktur field utama kelas Anda
+        fields[1] = 88
+        fields[2] = {}
+        fields[2][1] = {}
+        fields[2][1][1] = int(bundle_id)
+        return self._builder(fields=list(fields.items()))
+
+    def bundle_packet(self, bundle_id):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 88
+        fields[2] = {}
+        fields[2][1] = {}
+        fields[2][1][1] = int(bundle_id)
+        fields[2][1][2] = 1
+        fields[2][2] = 2
+        return self._builder(fields=list(fields.items()))
+
+    def reject_invite(self, ten, uid, sid):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 5
+        fields[2] = {}
+        fields[2][1] = int(uid)
+        fields[2][3] = int(sid)
+        fields[2][4] = str(ten if ten else self.account_name)
+        return self._builder(fields=list(fields.items()))
+
+    def ghost(self, uid, hv):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 61
+        fields[2] = {}
+        fields[2][1] = int(uid)
+        fields[2][2] = {}
+        fields[2][2][1] = int(uid)
+        fields[2][2][3] = "[b][%s]Telegram  [FFFFFF]:  [00FFFF]ZuyFFID" % grcolor()
+        fields[2][2][6] = self.digtstimes()
+        fields[2][2][7] = 0x01
+        fields[2][2][9] = 0x01
+        fields[2][3] = str(hv)
+        return self._builder(fields=list(fields.items()))
+
+    def play_animation(self, aid):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 88
+        fields[2] = {}
+        fields[2][1] = {}
+        fields[2][1][1] = int(aid)
+        return self._builder(fields=list(fields.items()))
+
+    def show_animation_skin(self, aid):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 88
+        fields[2] = {}
+        fields[2][1] = {}
+        fields[2][1][1] = int(aid)
+        fields[2][1][2] = int(1)
+        fields[2][2] = {}
+        fields[2][2][1] = int(aid)
+        return self._builder(fields=list(fields.items()))
+
+    def play_emote(self, eid, ids=[]):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 21
+        fields[2] = {}
+        fields[2][1] = self.account_id
+        fields[2][2] = 0x362E3D41
+        fields[2][5] = list([{1: id, 3: eid} for id in ids])
+        return self._builder(fields=list(fields.items()))
+
+    def start_match(self):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 9
+        fields[2] = {}
+        fields[2][1] = 1
+        return self._builder(fields=list(fields.items()))
+
+    def ask_for_skin(self, uid):
+        fields = {}
+        fields[0] = 5
+        fields[1] = 77
+        fields[2] = {}
+        fields[2][1] = uid
+        fields[2][2] = self.account_id
+        return self._builder(fields=list(fields.items()))
+
+    def join_room(self, rid):
+        fields = {}
+        fields[0] = 14
+        fields[1] = 3
+        fields[2] = {}
+        fields[2][1] = int(rid)
+        fields[2][9] = bytes([1, 7, 9, 10, 11, 18, 25, 26, 32])
+        fields[2][10] = 0x1
+        fields[2][12] = bytes([255, 255, 255, 255, 255, 255, 255, 255, 255, 1,
+                               255, 255, 255, 255, 255, 255, 255, 255, 255, 1])
+        fields[2][13] = 0x1
+        fields[2][14] = 0x1
+        fields[2][16] = self.account_region
+        return self._builder(fields=list(fields.items()))
+
+    def request_join_room(self, room_id, user_id):
+        fields = {}
+        fields[0] = 14
+        fields[1] = 78
+        fields[2] = {}
+        fields[2][1] = int(room_id)
+        fields[2][4] = 330
+        fields[2][5] = 6000
+        fields[2][6] = 228
+        fields[2][10] = getavatar()
+        fields[2][11] = int(user_id)
+        fields[2][12] = 1
+        return self._builder(fields=list(fields.items()))
+
+    def get_history(self, uid):
+        uid = Encrypt(uid).hex()
+        length = len(uid)
+        match length:
+            case 8:
+                cc = "080112080A04{}1005".format(uid)
+            case 10:
+                cc = "080112090A05{}1005".format(uid)
+            case _:
+                return None
+        packet = AES_CBC128(bytes.fromhex(cc), self.key, self.iv).hex()
+        return bytes.fromhex("0f0100000010" + packet)

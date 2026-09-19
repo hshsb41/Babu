@@ -1,0 +1,1035 @@
+import requests, json, base64, time, struct, datetime, re
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from protobuf_decoder.protobuf_decoder import Parser
+from typing import Dict, Any, Optional, Tuple, Union, List
+from dataclasses import dataclass
+
+
+class ProtoBuf:
+    def __init__(self, data):
+        self.data = data
+
+    def varint(self, buffer: bytes, pos: int = 0) -> Tuple[int, int]:
+        result, shift = 0, 0
+        while shift < 64 and pos < len(buffer):
+            byte = buffer[pos]
+            pos += 1
+            result |= (byte & 0x7F) << shift
+            if not (byte & 0x80):
+                return result, pos
+            shift += 7
+        return result, pos
+
+    def repeated(self, data: bytes) -> List[int]:
+        pos, out = 0, []
+        while pos < len(data):
+            val, pos = self.varint(data, pos)
+            out.append(val)
+        return out
+
+    def string(self, buffer: bytes, pos: int) -> Tuple[str, int]:
+        length, pos = self.varint(buffer, pos)
+        newpos = min(pos + length, len(buffer))
+        value = buffer[pos:newpos]
+        try:
+            value = value.decode("utf-8")
+        except:
+            pass
+        return value, newpos
+
+    def fixed32(self, buffer: bytes, pos: int) -> Tuple[int, int]:
+        return (struct.unpack("<I", buffer[pos:pos + 4])[0], pos + 4) if pos + 4 <= len(buffer) else (0, pos)
+
+    def fixed64(self, buffer: bytes, pos: int) -> Tuple[int, int]:
+        return (struct.unpack("<Q", buffer[pos:pos + 8])[0], pos + 8) if pos + 8 <= len(buffer) else (0, pos)
+
+    def parse_field(self, buffer: bytes, pos: int) -> Tuple[int, Any, int]:
+        if pos >= len(buffer):
+            return 0, None, pos
+        key, pos = self.varint(buffer, pos)
+        field_number, wire_type = key >> 3, key & 0x7
+        try:
+            if wire_type == 0:
+                value, pos = self.varint(buffer, pos)
+            elif wire_type == 1:
+                value, pos = self.fixed64(buffer, pos)
+            elif wire_type == 2:
+                value, pos = self.string(buffer, pos)
+            elif wire_type == 5:
+                value, pos = self.fixed32(buffer, pos)
+            else:
+                return field_number, None, pos
+        except (struct.error, IndexError):
+            return field_number, None, pos
+        return field_number, value, pos
+
+    def protobuf(self, buffer: Optional[bytes] = None, offset: int = 0) -> Dict[str, Any]:
+        if buffer is None:
+            buffer = self.data
+        result = {}
+        while offset < len(buffer):
+            field_number, value, offset = self.parse_field(buffer, offset)
+            if isinstance(value, bytes) and value:
+                try:
+                    nested = self.protobuf(value)
+                    if nested:
+                        value = nested
+                except:
+                    pass
+            key = str(field_number)
+            result.setdefault(key, []).append(value)
+        return {k: v[0] if len(v) == 1 else v for k, v in result.items()}
+
+    def fieldsRaw(self, buf: bytes, pos: int) -> Tuple[int, int, bytes, int, int]:
+        start = pos
+        key, pos = self.varint(buf, pos)
+        num, wt = key >> 3, key & 0x7
+        if wt == 0:
+            _, end = self.varint(buf, pos)
+        elif wt == 1:
+            end = pos + 8
+        elif wt == 2:
+            length, lp = self.varint(buf, pos)
+            end = lp + length
+        elif wt == 5:
+            end = pos + 4
+        else:
+            return num, wt, b'', pos, pos
+        return num, wt, buf[start:end], pos, end
+
+    def EXTRACT_FIELDS(self, fields: List[int], mode: str = "repeated") -> List:
+        cur = self.data
+        for depth, target in enumerate(fields):
+            pos = 0
+            found = False
+            if depth == len(fields) - 1:
+                results = []
+                while pos < len(cur):
+                    num, wt, raw, val_start, val_end = self.fieldsRaw(cur, pos)
+                    if num == target:
+                        if mode == "repeated":
+                            if wt == 0:
+                                val, _ = self.varint(cur, val_start)
+                                results.append(val)
+                            elif wt == 2:
+                                _, lp = self.varint(cur, val_start)
+                                packed = cur[lp:val_end]
+                                results += self.repeated(packed)
+                        elif mode == "bytes":
+                            if wt == 2:
+                                _, lp = self.varint(cur, val_start)
+                                results.append(cur[lp:val_end])
+                            else:
+                                results.append(cur[val_start:val_end])
+                    pos = val_end
+                if len(results) == 0:
+                    return []
+                if len(results) == 1:
+                    return results[0]
+                return results
+            else:
+                while pos < len(cur):
+                    num, wt, raw, val_start, val_end = self.fieldsRaw(cur, pos)
+                    if num == target and wt == 2:
+                        _, lp = self.varint(cur, val_start)
+                        cur = cur[lp:val_end]
+                        found = True
+                        break
+                    pos = val_end
+                if not found:
+                    return []
+        return []
+
+
+def Encrypt(value):
+    value = int(value)
+    result = []
+    while value > 0x7F:
+        result.append((value & 0x7F) | 0x80)
+        value >>= 7
+    result.append(value)
+    return bytes(result)
+
+
+def Decrypt(value):
+    result, shift = 0, 0
+    for byte in bytes.fromhex(value):
+        result |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            break
+        shift += 7
+    return result
+
+
+def parse_results(parsed_results):
+    result_dict = {}
+    for result in parsed_results:
+        if result.field not in result_dict:
+            result_dict[result.field] = []
+        field_data = {}
+        if result.wire_type in ["varint", "string", "bytes"]:
+            field_data = result.data
+        elif result.wire_type == "length_delimited":
+            field_data = parse_results(result.data.results)
+        result_dict[result.field].append(field_data)
+    return {
+        key: value[0] if len(value) == 1 else value
+        for key, value in result_dict.items()
+    }
+
+
+protobuf_dec = lambda data: json.dumps(parse_results(
+    Parser().parse(data)
+), ensure_ascii=False)
+
+
+def AES_CBC128(data, key, iv):
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    return cipher.encrypt(pad(data, 0x10))
+
+
+def create_varint_field(field_number, value):
+    field_header = (field_number << 3) | 0
+    return Encrypt(field_header) + Encrypt(value)
+
+
+def create_length_delimited_field(field_number, value):
+    field_header = (field_number << 3) | 2
+    encoded_value = value.encode() if isinstance(value, str) else value
+    return Encrypt(field_header) + Encrypt(len(encoded_value)) + encoded_value
+
+
+def pb_encode(fields):
+    packet = bytearray()
+    for field, value in fields.items():
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    packet.extend(create_length_delimited_field(field, pb_encode(item)))
+        elif isinstance(value, dict):
+            nested_packet = pb_encode(value)
+            packet.extend(create_length_delimited_field(field, nested_packet))
+        elif isinstance(value, int):
+            packet.extend(create_varint_field(field, value))
+        elif isinstance(value, str) or isinstance(value, bytes):
+            packet.extend(create_length_delimited_field(field, value))
+    return bytes(packet)
+
+
+class gayerr(Exception):
+    pass
+
+
+@dataclass
+class account_data:
+    access_token = ""
+    open_id = ""
+    platform = 0x4
+    login_platform = 0x4
+    main_active_platform = 0x4
+    chat_ip = chat_port = online_ip = online_port = ""
+    create_time = None
+    expiry_time = None
+    guild_id = None
+    guild_code = None
+    login_token = None
+    account_id = None
+    base_url = None
+    login_time = None
+    nickname = None
+    region = None
+    server = None
+    key = None
+    iv = None
+
+
+class gringay:
+    @staticmethod
+    def tokendecode(token):
+        if not isinstance(token, str):
+            print(f"[tokendecode] token not str: {type(token)}")
+            return None
+        try:
+            parts = token.split(".")
+            if len(parts) != 3:
+                raise gayerr("Invalid token format")
+            payload = parts[1]
+            payload += "=" * (0x4 - len(payload) % 0x4)
+            return json.loads(base64.urlsafe_b64decode(payload).decode('utf-8'))
+        except Exception as e:
+            print("[tokendecode ERROR]", e)
+            return None
+
+    @staticmethod
+    def format_timestamp(timestamp):
+        if timestamp is None:
+            return ""
+        return time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(timestamp))
+
+
+def storeApps(package):
+    print(f"[storeApps] Fetching version for: {package}")
+    I = requests.get(f"https://play.google.com/store/apps/%s" % package)
+    I = re.search(r'\[\[\["(\d+\.\d+\.\d+)"\]\]', I.text)
+    if I:
+        print(f"[storeApps] Version found: {I.group(1)}")
+        return I.group(1)
+    print("[storeApps] Version not found")
+    return None
+
+
+def bdversion(ver: str = storeApps("details?id=com.dts.freefireth")):
+    if not ver:
+        ver = storeApps("details?id=com.dts.freefireth")
+    print(f"[bdversion] Using version: {ver}")
+    I = "https://version.ggwhitehawk.com/live/ver.php{}"
+    II = "?version=%s&lang=vi&device=android&region=VN" % ver
+    print(f"[bdversion] Request URL: {I.format(II)}")
+    res = requests.get(I.format(II))
+    print(f"[bdversion] Response status: {res.status_code}")
+    return res.json()
+
+
+class APIClient:
+    def __init__(self):
+        self._data = account_data()
+        print("[APIClient] Initializing...")
+        detail_vers = bdversion()
+        self.is_emulator = False
+        self.language = "ind"
+        self.base_url = detail_vers["server_url"]
+        self.client_version = detail_vers["remote_version"]
+        self.release_version = detail_vers["latest_release_version"]
+        self.key = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
+        self.iv = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+            "X-GA": "v1 1", "Content-Type": "application/x-www-form-urlencoded",
+            "Accept-Encoding": "deflate, gzip", "Accept": "*/*", "X-Unity-Version": "2018.4.12f1",
+            "ReleaseVersion": "OB55"
+        })
+        self.logindata = {}
+        print(f"[APIClient] base_url: {self.base_url}")
+        print(f"[APIClient] client_version: {self.client_version}")
+        print(f"[APIClient] release_version: {self.release_version}")
+
+    # ==================================================================
+    # AUTH
+    # ==================================================================
+    def auth_guest_token(self, uid, password):
+        print(f"[auth_guest_token] UID: {uid}")
+        payload = {
+            "uid": str(uid), "password": str(password),
+            "response_type": "token", "client_type": "2", "client_id": "100067",
+            "client_secret": bytes([50, 101, 101, 52, 52, 56, 49, 57, 101, 57, 98, 52, 53, 57, 56, 56, 52, 53, 49, 52, 49, 48, 54, 55, 98, 50, 56, 49, 54, 50, 49, 56, 55, 52, 100, 48, 100, 53, 100, 55, 97, 102, 57, 100, 56, 102, 55, 101, 48, 48, 99, 49, 101, 53, 52, 55, 49, 53, 98, 55, 100, 49, 101, 51]).decode()
+        }
+        try:
+            data = requests.post(
+                "https://auth.garena.com/oauth/guest/token/grant",
+                data=payload,
+                headers={
+                    "Accept-Encoding": "gzip, deflate",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "Mozilla/5.0 (Android 9; Mobile; rv:91.0) Gecko/91.0 Firefox/91.0",
+                }
+            ).json()
+            print(f"[auth_guest_token] Response: {data}")
+            if "access_token" not in data:
+                return "account not found"
+            self._data.access_token = data["access_token"]
+            self._data.open_id = data["open_id"]
+            self._data.platform = data.get("platform", 0x4)
+            self._data.login_platform = data.get("login_platform", 0x4)
+            self._data.main_active_platform = data.get("main_active_platform")
+            self._data.create_time = data.get("create_time")
+            self._data.expiry_time = data.get("expiry_time")
+        except Exception as e:
+            print("[auth_guest_token ERROR]", e)
+
+    def auth_token_inspect(self, access_token):
+        print("[auth_token_inspect] Inspecting token...")
+        try:
+            data = requests.get(
+                "https://auth.garena.com/oauth/token/inspect",
+                params={"token": access_token}
+            ).json()
+            print(f"[auth_token_inspect] Response: {data}")
+            if "open_id" not in data:
+                raise gayerr("Invalid access token")
+            self._data.access_token = access_token
+            self._data.open_id = data["open_id"]
+            self._data.platform = data.get("platform", 0x4)
+            self._data.login_platform = data.get("login_platform", 0x4)
+            self._data.main_active_platform = data.get("main_active_platform")
+            self._data.create_time = data.get("create_time")
+            self._data.expiry_time = data.get("expiry_time")
+        except Exception as e:
+            print("[auth_token_inspect ERROR]", e)
+
+    # ==================================================================
+    # MAJOR LOGIN
+    # ==================================================================
+    def _build_major_login_fields(self):
+        fields = {}
+        fields[3] = time.strftime("%Y-%m-%d %H:%M:%S")
+        fields[4] = "free fire"
+        fields[5] = 1
+        fields[7] = self.client_version
+        fields[8] = "Android OS 10 / API-29 (QP1A.190711.020/V12.0.11.0.QJECNXM)"
+        fields[9] = "Handheld"
+        fields[10] = "Singtel"
+        fields[11] = "WIFI"
+        fields[12] = 1280
+        fields[13] = 720
+        fields[14] = "320"
+        fields[15] = "ARM64 FP ASIMD AES | 2304 | 8"
+        fields[16] = 4095
+        fields[17] = "Mali-G610"
+        fields[18] = "OpenGL ES 3.2 v1.g12p0-01eac0.d80164e2f5b37cc3667103831c67a8c0"
+        fields[19] = "Google|2fc357da-6bd4-41f5-8a81-761830e3c57b"
+        fields[20] = "156.59.172.202"
+        fields[21] = self.language
+        fields[22] = str(self._data.open_id)
+        fields[23] = "4"
+        fields[24] = "Handheld"
+        fields[25] = "Xiaomi M2007J22C"
+        fields[26] = "ID"
+        fields[29] = str(self._data.access_token)
+        fields[30] = 1
+        fields[41] = "Singtel"
+        fields[42] = "WIFI"
+        fields[57] = "7428b253defc164018c604a1ebbfebdf"
+        fields[60] = 110357
+        fields[61] = 17420
+        fields[62] = 2085
+        fields[64] = 17548
+        fields[65] = 110357
+        fields[66] = 17548
+        fields[67] = 110357
+        fields[73] = 1
+        fields[74] = "/data/app/com.dts.freefireth-jdGxKdCxd2rAcSKlP2O2Cw==/lib/arm64"
+        fields[76] = 1
+        fields[77] = "b8e0cd5e295eee42f5860d3c86e483dd|/data/app/com.dts.freefireth-jdGxKdCxd2rAcSKlP2O2Cw==/base.apk"
+        fields[78] = 3
+        fields[79] = 2
+        fields[81] = "64"
+        fields[83] = "2019121229"
+        fields[85] = 3
+        fields[86] = "OpenGLES2"
+        fields[87] = 4095
+        fields[88] = 4
+        fields[92] = 10097
+        fields[93] = "android"
+        fields[94] = "KqsHT8j50a8NJGxgEw/qstbnFucZg8o04IF557l38TzRbWzfqlONOpwKXPToQ0gdM0L7V8E015BH2vX+fDNGvA4RxVPk9baFr/jRixPleQpoa411"
+        fields[95] = 111207
+        fields[96] = "{\"cur_rate\":null,\"support_etc2\":false}"
+        fields[97] = 1
+        fields[98] = 1
+        fields[99] = "4"
+        fields[100] = "4"
+        fields[102] = "@PBGV\\_\u00005"
+        fields[104] = 85111
+        fields[105] = 1
+        fields[106] = "https://dl.gmc.freefiremobile.com/live/ABHotUpdates/|https://core-gmc.freefiremobile.com/live/ABHotUpdates/|6b2078db9d22dd98f8e9386a39af8462"
+        fields[107] = "c8e41b7a93f02d56e1a94c7b8203f5d1"
+        return fields
+
+    def _try_parse_with_custom_pb(self, raw_bytes, required_keys):
+        try:
+            pb = ProtoBuf(raw_bytes)
+            res = pb.protobuf()
+        except Exception:
+            return None
+        if not isinstance(res, dict) or not res:
+            return None
+
+        found = [k for k in required_keys if k in res]
+        if len(found) < 2:
+            return None
+
+        # ---------- MajorLogin ----------
+        if "8" in required_keys and "10" in required_keys:
+            token_val = pb.EXTRACT_FIELDS([8], mode="bytes")
+            if isinstance(token_val, list):
+                token_val = token_val[0] if token_val else None
+            if not isinstance(token_val, bytes):
+                return None
+            try:
+                token_str = token_val.decode("utf-8", errors="ignore")
+            except Exception:
+                return None
+            if token_str.count(".") != 2 or len(token_str) < 50:
+                return None
+            res["8"] = token_str
+
+            url_val = pb.EXTRACT_FIELDS([10], mode="bytes")
+            if isinstance(url_val, list):
+                url_val = url_val[0] if url_val else None
+            if not isinstance(url_val, bytes):
+                return None
+            try:
+                url_str = url_val.decode("utf-8", errors="ignore")
+            except Exception:
+                return None
+            if "http" not in url_str:
+                return None
+            res["10"] = url_str
+
+            time_val = pb.EXTRACT_FIELDS([21], mode="repeated")
+            if isinstance(time_val, list):
+                time_val = time_val[0] if time_val else None
+            if isinstance(time_val, int) and time_val > 0:
+                res["21"] = time_val
+
+            key_raw = pb.EXTRACT_FIELDS([22], mode="bytes")
+            iv_raw = pb.EXTRACT_FIELDS([23], mode="bytes")
+            if isinstance(key_raw, list):
+                key_raw = key_raw[0] if key_raw else None
+            if isinstance(iv_raw, list):
+                iv_raw = iv_raw[0] if iv_raw else None
+            if isinstance(key_raw, bytes) and len(key_raw) == 16:
+                res["22"] = key_raw
+            if isinstance(iv_raw, bytes) and len(iv_raw) == 16:
+                res["23"] = iv_raw
+
+        # ---------- GetLoginData ----------
+        if "1" in required_keys and "4" in required_keys:
+            acc_id = pb.EXTRACT_FIELDS([1], mode="repeated")
+            if isinstance(acc_id, list):
+                acc_id = acc_id[0] if acc_id else None
+            if not isinstance(acc_id, int) or acc_id < 1000:
+                return None
+            res["1"] = acc_id
+
+            nick = pb.EXTRACT_FIELDS([4], mode="bytes")
+            if isinstance(nick, list):
+                nick = nick[0] if nick else None
+            if isinstance(nick, bytes):
+                try:
+                    res["4"] = nick.decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+
+            online = pb.EXTRACT_FIELDS([14], mode="bytes")
+            if isinstance(online, list):
+                online = online[0] if online else None
+            if isinstance(online, bytes):
+                try:
+                    s = online.decode("utf-8", errors="ignore")
+                    if ":" in s:
+                        res["14"] = s
+                except Exception:
+                    pass
+
+            chat = pb.EXTRACT_FIELDS([32], mode="bytes")
+            if isinstance(chat, list):
+                chat = chat[0] if chat else None
+            if isinstance(chat, bytes):
+                try:
+                    s = chat.decode("utf-8", errors="ignore")
+                    if ":" in s:
+                        res["32"] = s
+                except Exception:
+                    pass
+
+            gid = pb.EXTRACT_FIELDS([30], mode="repeated")
+            if isinstance(gid, list):
+                gid = gid[0] if gid else None
+            if isinstance(gid, int) and gid > 0:
+                res["30"] = gid
+
+            gcode = pb.EXTRACT_FIELDS([31], mode="repeated")
+            if isinstance(gcode, list):
+                gcode = gcode[0] if gcode else None
+            if isinstance(gcode, int):
+                res["31"] = gcode
+
+            for f in ["3", "24"]:
+                r = pb.EXTRACT_FIELDS([int(f)], mode="bytes")
+                if isinstance(r, list):
+                    r = r[0] if r else None
+                if isinstance(r, bytes):
+                    try:
+                        res[f] = r.decode("utf-8", errors="ignore")
+                    except Exception:
+                        pass
+
+        return res
+
+    def _parse_response(self, raw_bytes, required_keys, tag="parse"):
+        """Cari parse terbaik via scoring — coba semua offset + AES decrypt."""
+        # DEBUG: coba decrypt [16 IV][CT] dulu (kemungkinan format sebenarnya)
+        if len(raw_bytes) > 16 and (len(raw_bytes) - 16) % 16 == 0:
+            for label_iv, iv_try in [("iv[:16]", raw_bytes[:16]), ("static_iv", self.iv)]:
+                try:
+                    ct_try = raw_bytes[16:] if label_iv == "iv[:16]" else raw_bytes
+                    cipher = AES.new(self.key, AES.MODE_CBC, iv_try)
+                    dec_try = cipher.decrypt(ct_try)
+                    try:
+                        dec_try = unpad(dec_try, 16)
+                    except Exception:
+                        pass
+                    print(f"[{tag}] DEBUG decrypt[{label_iv}] hex[:80]: {dec_try.hex()[:80]}")
+                    result = self._try_parse_with_custom_pb(dec_try, required_keys)
+                    if result:
+                        print(f"[{tag}] DECRYPT[{label_iv}] SUCCESS! keys={list(result.keys())}")
+                        sample = {k: (str(v)[:80] if isinstance(v, str) else v) for k, v in result.items()}
+                        print(f"[{tag}] Sample: {json.dumps(sample, indent=2, default=str)[:800]}")
+                        return result
+                except Exception as e:
+                    pass
+
+        # Scoring: kumpulkan semua kandidat parse
+        candidates = []
+
+        # Kandidat: skip 0-32 byte
+        for skip in range(0, 33):
+            try:
+                candidate = raw_bytes[skip:]
+                result = self._try_parse_with_custom_pb(candidate, required_keys)
+                if result:
+                    score = len([k for k in required_keys if k in result])
+                    candidates.append((score, skip, f"skip={skip}", result))
+            except Exception:
+                continue
+
+        # Kandidat: AES decrypt kombinasi
+        for label, iv_used in [("static_iv", self.iv), ("first16", raw_bytes[:16] if len(raw_bytes) >= 16 else self.iv)]:
+            for off in [0, 16, 32]:
+                try:
+                    ct = raw_bytes[off:]
+                    if len(ct) % 16 != 0 or len(ct) == 0:
+                        continue
+                    cipher = AES.new(self.key, AES.MODE_CBC, iv_used)
+                    dec = cipher.decrypt(ct)
+                    try:
+                        dec = unpad(dec, 16)
+                    except Exception:
+                        pass
+                    result = self._try_parse_with_custom_pb(dec, required_keys)
+                    if result:
+                        score = len([k for k in required_keys if k in result])
+                        candidates.append((score, off, f"AES[{label},off={off}]", result))
+                except Exception:
+                    continue
+
+        if not candidates:
+            try:
+                import os
+                fname = f"{tag}_dump.hex"
+                with open(fname, "w") as f:
+                    f.write(raw_bytes.hex())
+                print(f"[{tag}] All attempts failed. Hex dumped to {os.path.abspath(fname)}")
+            except Exception as e:
+                print(f"[{tag}] dump error: {e}")
+            return None
+
+        # Sort by score descending
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_offset, best_label, best_result = candidates[0]
+
+        print(f"[{tag}] PARSE SUCCESS via '{best_label}' (score={best_score}, keys={list(best_result.keys())})")
+        sample = {k: (str(v)[:80] if isinstance(v, str) else v) for k, v in best_result.items()}
+        print(f"[{tag}] Sample: {json.dumps(sample, indent=2, default=str)[:800]}")
+        return best_result
+
+    def MajorLogin(self):
+        print("=" * 60)
+        print("[MajorLogin] Starting...")
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            print(f"[MajorLogin] Attempt {attempt}/{max_attempts}")
+            try:
+                fields = self._build_major_login_fields()
+                encoded = AES_CBC128(pb_encode(fields), self.key, self.iv)
+                url = "%sMajorLogin" % self.base_url
+                headers = {
+                    "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+                    "Accept": "*/*",
+                    "Accept-Encoding": "deflate, gzip",
+                    "X-GA-SV": "1789553639",
+                    "Authorization": "Bearer",
+                    "X-GA": "v1 1",
+                    "ReleaseVersion": "OB55",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "X-Unity-Version": "2018.4.12f1",
+                }
+                print(f"[MajorLogin] URL: {url}")
+                print(f"[MajorLogin] Payload length: {len(encoded)} bytes")
+                response = self.session.post(url, headers=headers, data=encoded)
+                print(f"[MajorLogin] Response status: {response.status_code}")
+                print(f"[MajorLogin] Response length: {len(response.content)} bytes")
+                print(f"[MajorLogin] Response hex (first 80): {response.content.hex()[:80]}")
+
+                res = self._parse_response(response.content, ["8", "10", "21"], "MajorLogin")
+                if not res or not res.get("8") or not res.get("10"):
+                    print(f"[MajorLogin] Attempt {attempt} failed to parse, retrying...")
+                    time.sleep(1)
+                    continue
+
+                # ===== Mapping =====
+                server_val = res.get("5")
+                if isinstance(server_val, list):
+                    server_val = next((v for v in server_val if isinstance(v, str)), None)
+                self._data.server = server_val or res.get("3") or "live"
+                self._data.login_token = res.get("8")
+                self._data.base_url = res.get("10")
+                self._data.login_time = res.get("21")
+
+                key_val = res.get("22")
+                iv_val = res.get("23")
+                self._data.key = key_val if isinstance(key_val, bytes) and len(key_val) == 16 else self.key
+                self._data.iv = iv_val if isinstance(iv_val, bytes) and len(iv_val) == 16 else self.iv
+
+                # Simpan MajorLogin response sebagai logindata awal
+                self.logindata = dict(res) if res else {}
+
+                # Field 19 = region mapping (fallback standard)
+                if "19" not in self.logindata or not isinstance(self.logindata.get("19"), list):
+                    self.logindata["19"] = [
+                        {"1": 19, "2": "SAC"}, {"1": 21, "2": "ME"}, {"1": 22, "2": "NA"},
+                        {"1": 25, "2": "BD"}, {"1": 2, "2": "TH"}, {"1": 3, "2": "ID"},
+                        {"1": 4, "2": "TW"}, {"1": 11, "2": "RU"}, {"1": 12, "2": "EUROPE"},
+                        {"1": 20, "2": "IND"}, {"1": 23, "2": "PK"}, {"1": 1, "2": "VN"},
+                        {"1": 5, "2": "BR"}, {"1": 7, "2": "SG"}, {"1": 8, "2": "US"},
+                    ]
+
+                if isinstance(self._data.login_token, str):
+                    try:
+                        tok = gringay.tokendecode(self._data.login_token)
+                        if tok:
+                            self._data.account_id = tok.get("account_id")
+                            self._data.open_id = tok.get("external_id") or self._data.open_id
+                    except Exception as e:
+                        print("[MajorLogin] tokendecode error:", e)
+
+                print(f"[MajorLogin] SUCCESS on attempt {attempt}")
+                print(f"[MajorLogin] account_id: {self._data.account_id}")
+                print(f"[MajorLogin] server: {self._data.server}")
+                print(f"[MajorLogin] login_token: {str(self._data.login_token)[:60]}...")
+                print(f"[MajorLogin] base_url: {self._data.base_url}")
+                print(f"[MajorLogin] login_time: {self._data.login_time}")
+                print(f"[MajorLogin] key: {self._data.key.hex() if isinstance(self._data.key, bytes) else self._data.key}")
+                print(f"[MajorLogin] iv: {self._data.iv.hex() if isinstance(self._data.iv, bytes) else self._data.iv}")
+                print("=" * 60)
+                return
+            except Exception as e:
+                print(f"[MajorLogin] Attempt {attempt} exception: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(1)
+
+        print(f"[MajorLogin] All {max_attempts} attempts failed!")
+        print("=" * 60)
+
+    # ==================================================================
+    # GET LOGIN DATA
+    # ==================================================================
+    def _build_get_login_data_fields(self, tokendec):
+        fields = {}
+        fields[3] = time.strftime("%Y-%m-%d %H:%M:%S")
+        fields[4] = "free fire"
+        fields[5] = 1
+        fields[7] = self.client_version
+        fields[8] = "Android OS 10 / API-29 (QP1A.190711.020/V12.0.11.0.QJECNXM)"
+        fields[9] = "Handheld"
+        fields[10] = "Singtel"
+        fields[11] = "WIFI"
+        fields[12] = 1280
+        fields[13] = 720
+        fields[14] = "320"
+        fields[15] = "ARM64 FP ASIMD AES | 2304 | 8"
+        fields[16] = 4095
+        fields[17] = "Mali-G610"
+        fields[18] = "OpenGL ES 3.2 v1.g12p0-01eac0.d80164e2f5b37cc3667103831c67a8c0"
+        fields[19] = "Google|2fc357da-6bd4-41f5-8a81-761830e3c57b"
+        fields[20] = "156.59.172.202"
+        fields[21] = "ind"
+        fields[22] = str(tokendec.get("external_id", ""))
+        fields[23] = "4"
+        fields[24] = "Handheld"
+        fields[25] = "Xiaomi M2007J22C"
+        fields[26] = "ID"
+        fields[29] = str(tokendec.get("external_id", ""))
+        fields[30] = 1
+        fields[41] = "Singtel"
+        fields[42] = "WIFI"
+        fields[57] = str(tokendec.get("signature_md5", ""))
+        fields[60] = 110357
+        fields[61] = 17420
+        fields[62] = 2085
+        fields[64] = 17548
+        fields[65] = 110357
+        fields[66] = 17548
+        fields[67] = 110357
+        fields[73] = 1
+        fields[74] = "/data/app/com.dts.freefireth-jdGxKdCxd2rAcSKlP2O2Cw==/lib/arm64"
+        fields[76] = 1
+        fields[77] = "b8e0cd5e295eee42f5860d3c86e483dd|/data/app/com.dts.freefireth-jdGxKdCxd2rAcSKlP2O2Cw==/base.apk"
+        fields[78] = 3
+        fields[79] = 2
+        fields[81] = "64"
+        fields[83] = "2019121229"
+        fields[85] = 3
+        fields[86] = "OpenGLES2"
+        fields[87] = 4095
+        fields[88] = 4
+        fields[90] = "Jakarta"
+        fields[91] = "JK"
+        fields[92] = 10097
+        fields[93] = "android"
+        fields[94] = "KqsHT8j50a8NJGxgEw/qstbnFucZg8o04IF557l38TzRbWzfqlONOpwKXPToQ0gdM0L7V8E015BH2vX+fDNGvA4RxVPk9baFr/jRixPleQpoa411"
+        fields[95] = 111207
+        fields[96] = "{\"cur_rate\":null,\"support_etc2\":false}"
+        fields[97] = 1
+        fields[98] = 1
+        fields[99] = "0"
+        fields[100] = "4"
+        fields[102] = "@PBGV\\_\u00005"
+        fields[103] = 1
+        fields[104] = 85111
+        fields[105] = 1
+        fields[106] = "https://dl.gmc.freefiremobile.com/live/ABHotUpdates/|https://core-gmc.freefiremobile.com/live/ABHotUpdates/|6b2078db9d22dd98f8e9386a39af8462"
+        fields[107] = "c8e41b7a93f02d56e1a94c7b8203f5d1"
+        return fields
+
+    def GetLoginData(self):
+        print("=" * 60)
+        print("[GetLoginData] Starting...")
+        try:
+            tokendec = gringay.tokendecode(self._data.login_token)
+            if not tokendec:
+                print("[GetLoginData] tokendecode returned None, abort")
+                print("=" * 60)
+                return
+            print(f"[GetLoginData] Token decoded keys: {list(tokendec.keys())}")
+
+            for attempt_name, use_key, use_iv, use_host in [
+                ("static_key_iv_host_clientbp", self.key, self.iv, "clientbp.ppmainecoonghj.com"),
+                ("data_key_iv_host_clientbp", self._data.key, self._data.iv, "clientbp.ppmainecoonghj.com"),
+                ("static_key_iv_host_loginbp", self.key, self.iv, "loginbp.ppmainecoonghj.com"),
+            ]:
+                try:
+                    fields = self._build_get_login_data_fields(tokendec)
+                    encoded = AES_CBC128(pb_encode(fields), use_key, use_iv)
+                    url = "%s/GetLoginData" % self._data.base_url
+                    headers = {
+                        "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+                        "Accept": "*/*",
+                        "Accept-Encoding": "deflate, gzip",
+                        "X-GA-SV": "1789553640",
+                        "Authorization": "Bearer %s" % self._data.login_token,
+                        "X-GA": "v1 1",
+                        "ReleaseVersion": "OB55",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "X-Unity-Version": "2018.4.12f1",
+                        "Host": use_host,
+                    }
+                    print(f"[GetLoginData] Attempt: {attempt_name}")
+                    print(f"[GetLoginData] URL: {url}")
+                    print(f"[GetLoginData] Payload length: {len(encoded)} bytes")
+                    response = self.session.post(url, headers=headers, data=encoded)
+                    print(f"[GetLoginData] Response status: {response.status_code}")
+                    print(f"[GetLoginData] Response length: {len(response.content)} bytes")
+                    print(f"[GetLoginData] Response hex (first 80): {response.content.hex()[:80]}")
+                    if response.status_code != 200:
+                        try:
+                            print(f"[GetLoginData] Response body: {response.text[:500]}")
+                        except Exception:
+                            pass
+                        continue
+
+                    res = self._parse_response(response.content, ["1", "4", "14", "32"], "GetLoginData")
+                    if not res:
+                        print("[GetLoginData] FAILED to parse, trying next attempt")
+                        continue
+
+                    merged = dict(self.logindata) if self.logindata else {}
+                    merged.update(res)
+                    self.logindata = merged
+
+                    if res.get("1"):
+                        self._data.account_id = res.get("1")
+                    self._data.nickname = res.get("4") or self._data.nickname
+                    self._data.guild_id = res.get("30")
+                    self._data.guild_code = res.get("31")
+                    self._data.region = res.get("3") or res.get("24") or self._data.region
+
+                    online = res.get("14")
+                    if isinstance(online, str) and ":" in online:
+                        self._data.online_ip, self._data.online_port = online.rsplit(":", 1)
+
+                    chat = res.get("32")
+                    if isinstance(chat, str) and ":" in chat:
+                        self._data.chat_ip, self._data.chat_port = chat.rsplit(":", 1)
+
+                    print(f"[GetLoginData] SUCCESS on {attempt_name}")
+                    print(f"[GetLoginData] account_id: {self._data.account_id}")
+                    print(f"[GetLoginData] nickname: {self._data.nickname}")
+                    print(f"[GetLoginData] guild_id: {self._data.guild_id}")
+                    print(f"[GetLoginData] guild_code: {self._data.guild_code}")
+                    print(f"[GetLoginData] region: {self._data.region}")
+                    print(f"[GetLoginData] chat_ip: {self._data.chat_ip}")
+                    print(f"[GetLoginData] chat_port: {self._data.chat_port}")
+                    print(f"[GetLoginData] online_ip: {self._data.online_ip}")
+                    print(f"[GetLoginData] online_port: {self._data.online_port}")
+                    print("=" * 60)
+                    return
+                except Exception as e:
+                    print(f"[GetLoginData] Attempt {attempt_name} exception: {e}")
+                    continue
+
+            print("[GetLoginData] All attempts failed, keeping MajorLogin logindata")
+        except Exception as e:
+            print("[GetLoginData ERROR]", e)
+            import traceback
+            traceback.print_exc()
+        print("=" * 60)
+
+    # ==================================================================
+    # AUTH PACKET
+    # ==================================================================
+    def Group_aenhaamdtsmodz_XT(self) -> str:
+        print("[Group_aenhaamdtsmodz_XT] Building auth packet...")
+        try:
+            if self._data.account_id is None or self._data.login_token is None:
+                print("[Group_aenhaamdtsmodz_XT] account_id/login_token missing, skip")
+                return None
+            region_map = {}
+            if isinstance(self.logindata, dict) and "19" in self.logindata:
+                val19 = self.logindata["19"]
+                if isinstance(val19, list):
+                    try:
+                        for x in val19:
+                            if isinstance(x, dict) and "2" in x and "1" in x:
+                                region_map[str(x["2"]).upper()] = x["1"]
+                    except Exception:
+                        pass
+            if not region_map:
+                region_map = {
+                    "VN": 1, "TH": 2, "ID": 3, "TW": 4, "BR": 5, "SG": 7,
+                    "US": 8, "RU": 11, "EUROPE": 12, "SAC": 19, "IND": 20,
+                    "ME": 21, "NA": 22, "PK": 23, "BD": 25,
+                }
+            server_str = self._data.server if isinstance(self._data.server, str) else "live"
+            esid_val = region_map.get(server_str.upper())
+            if esid_val is None:
+                region_str = (self._data.region or "ID") if isinstance(self._data.region, str) else "ID"
+                esid_val = region_map.get(region_str.upper(), 3)
+            eid = hex(self._data.account_id)[2:]
+            bytestoken = self._data.login_token.encode()
+            encrypts = AES_CBC128(bytestoken, self._data.key, self._data.iv).hex()
+            lengths = hex(len(encrypts) // 2)[2:]
+            header = ("0" * 16)[:max(0, 16 - len(eid))]
+            packet = "%s%s%s%X%05d%s%s" % (
+                "%02d%02X" % (1, esid_val), header,
+                eid, self._data.login_time, 0x0, lengths, encrypts
+            )
+            print(f"[Group_aenhaamdtsmodz_XT] esid={esid_val} server={server_str}")
+            print(f"[Group_aenhaamdtsmodz_XT] Packet: {packet[:100]}...")
+            return bytes.fromhex(packet)
+        except Exception as e:
+            print("[Group_aenhaamdtsmodz_XT ERROR]", e)
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def auth(self, access_token, is_emulator=False):
+        print("=" * 60)
+        print("[auth] Starting authentication...")
+        print(f"[auth] access_token: {access_token[:50]}...")
+        print(f"[auth] is_emulator: {is_emulator}")
+        try:
+            self.is_emulator = is_emulator
+            if ":" in access_token:
+                uid, password = access_token.split(":")
+                self.auth_guest_token(int(uid), password)
+            else:
+                self.auth_token_inspect(access_token)
+            self.MajorLogin()
+
+            # Cek MajorLogin sukses atau tidak
+            if not self._data.login_token or not self._data.base_url:
+                print("[auth] MajorLogin failed, cannot continue")
+                print("=" * 60)
+                return "account not found"
+
+            self.GetLoginData()
+            authpacket = self.Group_aenhaamdtsmodz_XT()
+            if not authpacket:
+                print("[auth] Auth packet build failed")
+                print("=" * 60)
+                return "account not found"
+
+            result = self._build_api_response(authpacket)
+            print("[auth] Authentication completed successfully!")
+            return result
+        except Exception as e:
+            print("[auth ERROR]", e)
+            import traceback
+            traceback.print_exc()
+        print("=" * 60)
+
+    def _build_api_response(self, authpacket):
+        print("[_build_api_response] Building API response...")
+        if not self._data.login_token:
+            print("[_build_api_response] ERROR: login_token is empty!")
+            return "account not found"
+        data = gringay.tokendecode(self._data.login_token)
+        if self._data.guild_id:
+            guild = {"id": self._data.guild_id, "secret_code": self._data.guild_code}
+        else:
+            guild = False
+
+        saddress = {
+            "chatip": self._data.chat_ip,
+            "chatport": self._data.chat_port,
+            "onlineip": self._data.online_ip,
+            "onlineport": self._data.online_port,
+        }
+
+        # Pakai nickname dari GetLoginData (readable) — fallback ke JWT
+        nickname = self._data.nickname
+        if not nickname and data:
+            try:
+                nickname = base64.b64decode(data.get("nickname", "")).decode("utf-8", errors="ignore")
+            except Exception:
+                nickname = data.get("nickname")
+        if not nickname:
+            nickname = "Bot"
+
+        response = {}
+        response["CreateTime"] = gringay.format_timestamp(self._data.create_time)
+        response["ExpiryTime"] = gringay.format_timestamp(self._data.expiry_time)
+        response["UserAuthPacket"] = list(authpacket) if authpacket else []
+        response["UserAuthToken"] = self._data.login_token
+        response["UserNickName"] = nickname
+        response["UserAccountUID"] = (data.get("account_id") if data else None) or self._data.account_id
+        response["LockRegion"] = (data.get("lock_region") if data else None) or self._data.region
+        response["ClientVersion"] = data.get("client_version") if data else None
+        response["IsEmulator"] = data.get("is_emulator") if data else None
+        response["GuildData"] = guild
+        response["BaseUrl"] = self._data.base_url or ""
+        response["key"] = list(self._data.key) if self._data.key else []
+        response["iv"] = list(self._data.iv) if self._data.iv else []
+        response["logindata"] = self.logindata
+        response["GameServerAddress"] = saddress
+        print(f"[_build_api_response] Summary:")
+        print(f"  - UserNickName: {response['UserNickName']}")
+        print(f"  - UserAccountUID: {response['UserAccountUID']}")
+        print(f"  - LockRegion: {response['LockRegion']}")
+        print(f"  - ClientVersion: {response['ClientVersion']}")
+        print(f"  - GuildData: {response['GuildData']}")
+        print(f"  - BaseUrl: {response['BaseUrl']}")
+        print(f"  - GameServerAddress: {saddress}")
+        return response
+
+
+class FreeFireAPI:
+    def __init__(self):
+        self.client = APIClient()
+
+    def get(self, target: str, is_emulator: bool = False):
+        return self.client.auth(target, is_emulator)
